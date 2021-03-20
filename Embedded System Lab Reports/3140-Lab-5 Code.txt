@@ -1,0 +1,485 @@
+﻿#include "3140_concur.h"
+#include <stdlib.h>
+#include <fsl_device_registers.h>
+#include "realtime.h"
+typedef struct process_state {
+            unsigned int* sp;
+            int size;
+            struct process_state* next; //next process
+            realtime_t* start;
+            realtime_t* deadline;
+} process_t;
+
+
+process_t* process_queue = NULL; //Initialize the linked list for process queue and current process pointers
+process_t* current_process = NULL; 
+process_t* process_queue_unready_rt = NULL; //queue for real time processses that haven't started
+process_t* process_queue_ready_rt = NULL; // queue for ready processes
+realtime_t        current_time;
+int process_deadline_met;
+int process_deadline_miss;
+
+
+static void process_free(process_t *proc) { //free all allocated data
+        process_stack_free(proc->sp, proc->size);
+        free(proc->deadline);
+        free(proc->start);
+        free(proc);
+}
+void enqueue_process (process_t* process) { //Add process to queue
+        if (process_queue == NULL) { //If no processes currently in list
+            process_queue = process; // Make added process the head of linked list
+        }
+        
+        else {
+            process_t* tmp = process_queue; //temp pointer to traverse
+            while (tmp->next != NULL) {
+          // while there are more elements in the list
+          tmp = tmp->next;
+            }
+            
+            // now tmp is the last element in the list
+            tmp->next = process;
+            process->next = NULL;
+        }
+}
+void enqueue_ready_rt( process_t* process ){
+  if ( process_queue_ready_rt == NULL ){  //if queue is NULL, then just add to head
+   process_queue_ready_rt = process;
+         process->next = NULL;
+  }
+  else{
+   int proc_deadline = ( process -> deadline -> sec ) * 1000 + process -> deadline -> msec; //total deadline time
+         int start_head = ( process_queue_ready_rt -> deadline -> sec ) * 1000 +
+                            process_queue_ready_rt -> deadline -> msec;
+  
+   if ( start_head > proc_deadline ){ //if early start date, make head
+                process -> next = process_queue_ready_rt;
+                process_queue_ready_rt = process;
+                return;
+   }
+         
+   process_t* temp = process_queue_ready_rt; //otherwise add at node it belongs too
+   while( temp->next != NULL && ((temp->next->deadline->msec + temp->next->deadline->sec * 1000)<(process->deadline->msec + process->deadline->sec*1000))) //should make sure you dont get a seg fault by going over the tail
+            temp = temp-> next;
+         process->next = temp->next;
+         temp->next = process;
+        }
+ }
+
+
+ void enqueue_unready_rt( process_t* process ){
+  if ( process_queue_unready_rt == NULL ){  //if queue is NULL, then just add to head
+   process_queue_unready_rt = process;
+         process->next = NULL;
+  }
+  else{
+   int proc_start = ( process -> start -> sec ) * 1000 + process -> start -> msec; //total deadline time
+   //if ( process_queue_unready_rt -> next == NULL ){
+   int start_head = ( process_queue_unready_rt -> start -> sec ) * 1000 +
+                            process_queue_unready_rt -> start -> msec;
+  
+   if ( start_head > proc_start ){ //if earlier start time, add to head
+                process_t* temp = process_queue_unready_rt;
+                process_queue_unready_rt = process;
+                process_queue_unready_rt -> next = temp;
+                return;
+   }
+   process_t* temp = process_queue_unready_rt; //otherwise traverse to the right position in the list
+   //should make sure you dont get a seg fault by going over the tail
+   while( temp -> next != NULL ){
+                process_t* next_proc = temp -> next;
+                int temp_next_start = ( next_proc -> start -> sec ) * 1000
+                                                                                                        + next_proc -> start -> msec; //start for process one ahead
+                if ( temp_next_start > proc_start ){ //set process to node before
+                process -> next = next_proc;
+                temp -> next = process;
+                return; 
+                }
+                temp = temp -> next;
+         }
+        temp -> next = process;
+        }        
+ }
+
+
+process_t* dequeue_process (process_t** queue) { //remove a process from the list and return it
+        if (*queue == NULL)  return        NULL;        // if empty list, return null pointer
+        
+        if ((*queue)->next == NULL) { //if list contains only 1 element
+                process_t* temp = *queue; //temp is the head
+                *queue = NULL; //empty the list
+                return temp;
+            }
+        
+            process_t* new_head = (*queue)->next; //if more than 1 element, make the next element the head
+            process_t* temp = *queue; //set temp to the old head to be dequeued
+            temp->next = NULL;
+            *queue = new_head; //set new head
+            return temp;
+}
+
+
+int process_create (void (*f)(void), int n) {
+        
+        process_t* new_process = malloc(sizeof(process_t)); //allocate space for a new process struct
+        if (new_process == NULL) return -1; //if allocation didn't work, return -1 error code
+        unsigned int* sp = process_stack_init(f, n); //allocate stack space for program
+        if (sp == NULL) return -1; //If stack allocation failed return -1
+        
+        new_process->sp = sp; //initialize the newly allocated process
+        new_process->next = NULL;
+        new_process->size = n;
+        new_process->deadline = NULL;
+        new_process->start = NULL;
+        enqueue_process(new_process); //add process to the process queue
+        return 0;
+        
+}
+int process_rt_create(void (*f)(void), int n, realtime_t *start, realtime_t *deadline) {
+        process_t* new_process_rt = malloc(sizeof(process_t)); //allocate space for a new process struct
+        if (new_process_rt == NULL) return -1; //if allocation didn't work, return -1 error code
+        unsigned int* sp = process_stack_init(f, n); //allocate stack space for program
+        if (sp == NULL) return -1; //If stack allocation failed return -1
+        
+        new_process_rt->sp = sp; //initialize the newly allocated process
+        new_process_rt->next = NULL;
+        new_process_rt->size = n;
+        new_process_rt->start = malloc(sizeof(realtime_t)); //allocate space for realtime struct
+        new_process_rt->start->msec = start->msec; //copy by value
+        new_process_rt->start->sec = start->sec;
+        new_process_rt->deadline = malloc(sizeof(realtime_t)); //allocate space for realtime struct of deadline
+        // initialize temp struct to pass into deadline field of struct, need actual time of deadline not elapsed time from start
+        new_process_rt->deadline->msec = (deadline->msec + start->msec ) % 1000;
+        new_process_rt->deadline->sec = start->sec + deadline->sec + ( deadline->msec + start->msec ) / 1000;
+        enqueue_unready_rt(new_process_rt); //add process to the process queue
+        return 0;
+        
+}
+void process_start (void) {
+        
+SIM->SCGC6 |= SIM_SCGC6_PIT_MASK; // Enable clock
+        PIT->MCR = 0;
+        PIT->CHANNEL[0].LDVAL = DEFAULT_SYSTEM_CLOCK / 10;
+        NVIC_EnableIRQ(PIT0_IRQn); //Enable interrupts
+        
+        
+        //load timer for 1 ms on the real time clock
+        PIT->CHANNEL[1].LDVAL = DEFAULT_SYSTEM_CLOCK / 1000;
+        NVIC_EnableIRQ(PIT1_IRQn);
+        PIT->CHANNEL[1].TCTRL |= (1<<1); // enable interrupt
+        PIT->CHANNEL[1].TCTRL |= (1<<0); // start Timer 1
+        current_time.sec = 0;
+        current_time.msec = 0;
+        // Don't enable the timer yet. The scheduler will do so itself
+        process_deadline_met = 0;
+        process_deadline_miss = 0;
+        NVIC_SetPriority(PIT1_IRQn,0);
+        NVIC_SetPriority(SVCall_IRQn,1);
+        NVIC_SetPriority(PIT0_IRQn,2);
+        // Bail out fast if no processes were ever created
+        if (!process_queue && !process_queue_ready_rt && !process_queue_unready_rt) return;
+        process_begin();
+        
+}
+void PIT1_IRQHandler(void) {
+        //disable interrupts
+        __disable_irq();
+        if (current_time.msec == 999)
+        {
+            current_time.msec = 0;
+            current_time.sec++;
+        }
+        else
+            current_time.msec++;
+        PIT->CHANNEL[1].TFLG |= (1<<0);
+  //reenable interrupts
+        __enable_irq();
+}
+int ready (realtime_t arrival) {
+        if (arrival.sec < current_time.sec) // if arrival is after current time
+            return 1;
+        if (arrival.sec == current_time.sec) {
+            if(arrival.msec <= current_time.msec) //if seconds are equal but arrival is still after current time
+                return 1;
+        }
+        else
+          return 0; // if equal or before current time, it isn't ready
+}
+unsigned int * process_select (unsigned int * cursp) {
+//   __disable_irq(); //need these two lines idk why
+//  PIT -> CHANNEL[1].TFLG |= 0x1;
+        while(process_queue_unready_rt != NULL && ready(*process_queue_unready_rt->start))  //If unready queue has a process that is ready
+            enqueue_ready_rt(dequeue_process(&process_queue_unready_rt));  //dequeue the unready queue process and add to ready queue
+        
+        if (cursp) {
+            // Suspending a process which has not yet finished, save state and enqueue it back to correct process queue
+    if (current_process) {         
+                        current_process->sp = cursp;
+                                if (current_process->start == NULL) //normal queue
+                enqueue_process(current_process);
+                                else                                                                                                                                // real time queue
+                enqueue_ready_rt(current_process);
+                }
+   }
+        
+        else {
+            // Check if a process was running, free its resources if one just finished
+        if (current_process && current_process -> start) { //check deadline if its a real time process
+                if( ready( *(current_process->deadline) ) ) //if current process deadline is after the current time
+                    process_deadline_miss++;
+             
+                else
+                    process_deadline_met++;
+        }
+            if (current_process)
+                process_free( current_process );
+        }
+  
+        // Select the new current process from the front of the queue
+        if (process_queue_ready_rt) { //check from ready real time queue first
+            current_process = dequeue_process(&process_queue_ready_rt);
+            if (current_process)
+            return current_process->sp;
+        }
+        else if (process_queue){ //if no priority process ready pick from general queue
+        current_process = dequeue_process(&process_queue);
+            if (current_process)
+            return current_process->sp;
+        }
+        else if (process_queue_unready_rt){ //if no processes present, wait for priority queue
+            while(!ready(*process_queue_unready_rt->start)){} //busy wait until process is ready
+      process_select(NULL);  //go back to process select to update remaining ready processes                                                      
+        }
+        else
+            return NULL;
+        
+}
+
+
+
+
+Test case for busy wait
+
+
+/*************************************************************************
+ * Lab 5 "Easy test" used for grading
+ * 
+ * pNRT: ^_______r r r r v
+ * pRT1: ^b b b v
+ *
+ *   You should see the sequence of processes depicted above:
+ *     - Non real-time process pNRT and real-time process pRT1 both start
+ *       at time zero. pRT1 has priority, and blinks green LED 5x @ 2.5Hz.
+ *     - After pRT1 completes, pNRT begins and blinks red LED 10x @ 5Hz.
+ * 
+ *   pRT1 should miss its deadline, if you check in the debugger.
+ * 
+ ************************************************************************/
+ 
+#include "utils.h"
+#include "3140_concur.h"
+#include "realtime.h"
+
+
+/*--------------------------*/
+/* Parameters for test case */
+/*--------------------------*/
+
+
+
+
+ 
+/* Stack space for processes */
+#define NRT_STACK 80
+#define RT_STACK  80
+ 
+
+
+
+
+/*--------------------------------------*/
+/* Time structs for real-time processes */
+/*--------------------------------------*/
+
+
+/* Constants used for 'work' and 'deadline's */
+realtime_t t_1msec = {0, 1};
+realtime_t t_10sec = {10, 0};
+
+
+/* Process start time */
+realtime_t t_pRT1 = {3, 0};
+realtime_t t_pRT2 = {4, 0};
+ 
+/*------------------*/
+/* Helper functions */
+/*------------------*/
+void shortDelay(){delay();}
+void mediumDelay() {delay(); delay();}
+
+
+
+
+
+
+/*----------------------------------------------------
+ * Non real-time process
+ *   Blinks red LED 10 times. 
+ *   Should be blocked by real-time process at first.
+ *----------------------------------------------------*/
+ 
+void pRT2(void) {
+        int i;
+        for (i=0; i<4;i++){
+        LEDRed_On();
+        shortDelay();
+        LEDRed_Toggle();
+        shortDelay();
+        }
+        
+}
+
+
+/*-------------------
+ * Real-time process
+ *-------------------*/
+
+
+void pRT1(void) {
+        int i;
+        for (i=0; i<3;i++){
+        LEDBlue_On();
+        mediumDelay();
+        LEDBlue_Toggle();
+        mediumDelay();
+        }
+}
+
+
+
+
+/*--------------------------------------------*/
+/* Main function - start concurrent execution */
+/*--------------------------------------------*/
+int main(void) {        
+         
+        LED_Initialize();
+
+
+    /* Create processes */ 
+        //test if it busy waits when no non RT process and RT processes aren't ready
+                if (process_rt_create(pRT1, RT_STACK, &t_pRT1, &t_1msec) < 0) { return -1; } //blue light
+    if (process_rt_create(pRT2, RT_STACK, &t_pRT2, &t_1msec) < 0) { return -1; } //red light
+   
+    /* Launch concurrent execution */
+        process_start();
+
+
+  LED_Off();
+  while(process_deadline_miss>0) {
+                LEDGreen_On();
+                shortDelay();
+                LED_Off();
+                shortDelay();
+                process_deadline_miss--;
+        }
+        
+        /* Hang out in infinite loop (so we can inspect variables if we want) */ 
+        while (1);
+        return 0;
+}
+ }
+
+
+----------------------------working test case--------------------------
+/*************************************************************************
+ * Lab 5 "Test 1"
+ *
+
+
+/*--------------------------*/
+/* Parameters for test case */
+/*--------------------------*/
+#include "utils.h"
+#include "3140_concur.h"
+#include "realtime.h"
+ 
+/* Stack space for processes */
+#define NRT_STACK 80
+#define RT_STACK  80
+ 
+
+
+/*--------------------------------------*/
+/* Time structs for real-time processes */
+/*--------------------------------------*/
+/* Constants used for 'work' and 'deadline's */
+realtime_t t_1msec = {0, 1};
+realtime_t t_1sec = {1, 0};
+/* Process start time */
+realtime_t t_pRT1 = {3, 0};
+realtime_t t_pRT2 = {2, 0};
+ 
+/*------------------*/
+/* Helper functions */
+/*------------------*/
+void shortDelay(){delay();}
+void mediumDelay() {delay(); delay();}
+
+
+/*----------------------------------------------------
+ * Non real-time process
+ *   Blinks red LED 10 times.
+ *   Should be blocked by real-time process at first.
+ *----------------------------------------------------*/
+ 
+void pRT_Red(void) {
+ int i;
+ for (i=0; i<4;i++){
+ LEDRed_On();
+ shortDelay();
+ LEDRed_Toggle();
+ shortDelay();
+ }
+ 
+}
+/*-------------------
+ * Real-time process
+ *-------------------*/
+void pRT_Blue(void) {
+ int i;
+ for (i=0; i<4;i++){
+ LEDBlue_On();
+ mediumDelay();
+ LEDBlue_Toggle();
+ mediumDelay();
+ }
+}
+
+
+/*--------------------------------------------*/
+/* Main function - start concurrent execution */
+/*--------------------------------------------*/
+int main(void) { 
+ 
+ LED_Initialize();
+        /* Create processes */
+        if (process_rt_create(pRT_Blue, RT_STACK, &t_pRT1, &t_1sec) < 0) { return -1; }
+        if (process_rt_create(pRT_Red, RT_STACK, &t_pRT2, &t_1msec) < 0) { return -1; }
+  
+        /* Launch concurrent execution */
+ process_start();
+  LED_Off();
+  while(process_deadline_miss>0) {
+  LEDGreen_On();
+  shortDelay();
+  LED_Off();
+  shortDelay();
+  process_deadline_miss--;
+ }
+ 
+ /* Hang out in infinite loop (so we can inspect variables if we want) */
+ while (1);
+ return 0;
+}
